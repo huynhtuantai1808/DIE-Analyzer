@@ -37,6 +37,7 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
+      TZ: ${TZ:-Asia/Ho_Chi_Minh}
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-dieweb}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-dieweb}
       REDIS_URL: redis://redis:6379/0
       UPLOAD_DIR: /data/uploads
@@ -68,6 +69,7 @@ services:
     command: ["python", "-m", "app.worker"]
     env_file: .env
     environment:
+      TZ: ${TZ:-Asia/Ho_Chi_Minh}
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-dieweb}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-dieweb}
       REDIS_URL: redis://redis:6379/0
       UPLOAD_DIR: /data/uploads

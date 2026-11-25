@@ -5,12 +5,32 @@ import {
   RefreshCw, Users, FileSearch, Clock3, Hash, AlertTriangle,
   CheckCircle2, XCircle, Code, Archive, ShieldAlert, FileCode,
   Layers, ChevronRight, Bug, Key, Terminal, Settings, HardDrive,
-  Trash2, User, FolderX, FileText, Download, Check, X, Edit2
+  Trash2, User, FolderX, FileText, Download, Check, X, Edit2, Eye, EyeOff, Copy,
+  Lock, Globe, ScrollText, PauseCircle, PlayCircle
 } from 'lucide-react';
 
 const api = axios.create({ baseURL: '/api' });
 const fmt = n => n == null ? '—' : n < 1024 ? `${n} B` : n < 1048576 ? `${(n/1024).toFixed(1)} KB` : `${(n/1048576).toFixed(2)} MB`;
 const date = v => v ? new Date(v).toLocaleString() : '—';
+const ACTION_LABELS = {
+  LOGIN_SUCCESS: 'Đăng nhập thành công',
+  LOGIN_FAILED: 'Đăng nhập thất bại',
+  LOGOUT: 'Đăng xuất',
+  UPLOAD_SCAN: 'Tải lên tệp quét',
+  DELETE_SCAN: 'Xóa tệp quét',
+  BATCH_DELETE_SCANS: 'Xóa hàng loạt tệp',
+  EXPORT_PDF: 'Xuất báo cáo PDF',
+  USER_CREATE: 'Tạo tài khoản',
+  USER_UPDATE_LIMIT: 'Sửa giới hạn upload',
+  USER_RESET_PASSWORD: 'Đặt lại mật khẩu',
+  USER_SUSPEND: 'Tạm dừng tài khoản',
+  USER_ACTIVATE: 'Kích hoạt tài khoản',
+  USER_DELETE: 'Xóa tài khoản',
+  SETTINGS_UPDATE: 'Cập nhật cài đặt',
+  ADMIN_CLEANUP: 'Dọn dẹp lưu trữ',
+  EXPORT_LOGS: 'Xuất nhật ký',
+  CLEAR_LOGS: 'Xóa nhật ký cũ',
+};
 
 function Login({ onLogin }) {
   const [username, setUsername] = useState('admin'), [password, setPassword] = useState(''), [error, setError] = useState('');
@@ -23,8 +43,10 @@ function Login({ onLogin }) {
       const { data } = await api.post('/auth/login', form);
       localStorage.setItem('token', data.access_token);
       onLogin(data.user);
-    } catch {
-      setError('Đăng nhập thất bại. Vui lòng kiểm tra lại tài khoản hoặc mật khẩu.');
+    } catch (err) {
+      setError(err.response?.data?.detail && err.response?.status === 403
+        ? err.response.data.detail
+        : 'Đăng nhập thất bại. Vui lòng kiểm tra lại tài khoản hoặc mật khẩu.');
     }
   }
   return (
@@ -445,6 +467,20 @@ function App() {
   const [editingUserId, setEditingUserId] = useState(null);
   const [editingLimitVal, setEditingLimitVal] = useState('');
   const [savingLimit, setSavingLimit] = useState(false);
+  const [resetPassUserId, setResetPassUserId] = useState(null);
+  const [resetPassVal, setResetPassVal] = useState('');
+  const [showResetPass, setShowResetPass] = useState(false);
+  const [resettingPass, setResettingPass] = useState(false);
+  const [confirmDeleteUserId, setConfirmDeleteUserId] = useState(null);
+  const [deletingUser, setDeletingUser] = useState(false);
+  const [logs, setLogs] = useState([]);
+  const [loginSummary, setLoginSummary] = useState(null);
+  const [logFilterUser, setLogFilterUser] = useState('');
+  const [logFilterAction, setLogFilterAction] = useState('');
+  const [logFilterStatus, setLogFilterStatus] = useState('');
+  const [logFilterDays, setLogFilterDays] = useState('');
+  const [logQuery, setLogQuery] = useState('');
+  const [logsLoading, setLogsLoading] = useState(false);
 
   useEffect(() => {
     if (token) {
@@ -453,9 +489,14 @@ function App() {
     }
   }, [token]);
 
+  const hasActiveScans = useMemo(
+    () => scans.some(x => ['queued', 'running'].includes(x.status)),
+    [scans]
+  );
+
   useEffect(() => {
     if (me) {
-      refresh();
+      refresh(false);
       api.get('/settings').then(r => {
         setSettings(r.data);
         setUploadMbInput(r.data.max_upload_mb);
@@ -464,13 +505,20 @@ function App() {
         api.get('/users').then(r => setUsers(r.data)).catch(() => {});
         fetchStorageStats();
       }
-      const t = setInterval(refresh, 5000);
-      return () => clearInterval(t);
     }
   }, [me]);
 
   useEffect(() => {
-    if (me) refresh();
+    if (!me) return;
+    const intervalMs = hasActiveScans ? 4000 : 30000;
+    const t = setInterval(() => {
+      if (!document.hidden) refresh(true);
+    }, intervalMs);
+    return () => clearInterval(t);
+  }, [me, hasActiveScans, userFilter, query, selected?.id]);
+
+  useEffect(() => {
+    if (me) refresh(false);
   }, [userFilter, query]);
 
   useEffect(() => {
@@ -487,6 +535,9 @@ function App() {
   }, [selected?.id]);
 
   function logout() {
+    if (localStorage.getItem('token')) {
+      api.post('/auth/logout').catch(() => {});
+    }
     localStorage.removeItem('token');
     setToken(null);
     setMe(null);
@@ -495,6 +546,112 @@ function App() {
     delete api.defaults.headers.common.Authorization;
   }
 
+  async function fetchLogs(categoryOverride = null) {
+    if (!me || me.role !== 'admin') return;
+    setLogsLoading(true);
+    try {
+      const params = { limit: 300 };
+      const cat = categoryOverride !== null ? categoryOverride : (tab === 'logins' ? 'auth' : undefined);
+      if (cat) params.category = cat;
+      if (logFilterUser) params.user_id = parseInt(logFilterUser, 10);
+      if (logFilterAction) params.action = logFilterAction;
+      if (logFilterStatus) params.status = logFilterStatus;
+      if (logFilterDays) params.days = parseInt(logFilterDays, 10);
+      if (logQuery.trim()) params.q = logQuery.trim();
+      const { data } = await api.get('/admin/logs', { params });
+      setLogs(data);
+    } catch {
+      setNotice('Không thể tải dữ liệu nhật ký.');
+    } finally {
+      setLogsLoading(false);
+    }
+  }
+
+  async function fetchLoginSummary() {
+    if (!me || me.role !== 'admin') return;
+    try {
+      const { data } = await api.get('/admin/logs/summary');
+      setLoginSummary(data);
+    } catch {}
+  }
+
+  async function openLogins() {
+    setTab('logins');
+    setSelected(null);
+    setLogFilterAction('');
+    setLogFilterStatus('');
+    setLogFilterUser('');
+    setLogFilterDays('');
+    setLogQuery('');
+    await Promise.all([fetchLoginSummary(), fetchLogs('auth')]);
+  }
+
+  async function openLogs() {
+    setTab('logs');
+    setSelected(null);
+    setLogFilterAction('');
+    setLogFilterStatus('');
+    setLogFilterUser('');
+    setLogFilterDays('');
+    setLogQuery('');
+    await fetchLogs('');
+  }
+
+  async function exportLogs(format = 'csv', category = null) {
+    try {
+      setNotice(`Đang xuất tệp nhật ký (${format.toUpperCase()})...`);
+      const params = { format };
+      if (category) params.category = category;
+      if (logFilterUser) params.user_id = parseInt(logFilterUser, 10);
+      if (logFilterAction) params.action = logFilterAction;
+      if (logFilterStatus) params.status = logFilterStatus;
+      if (logFilterDays) params.days = parseInt(logFilterDays, 10);
+      if (logQuery.trim()) params.q = logQuery.trim();
+      const resp = await api.get('/admin/logs/export', { params, responseType: 'blob' });
+      const blob = new Blob([resp.data], { type: format === 'csv' ? 'text/csv;charset=utf-8' : 'application/json' });
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      const prefix = category === 'auth' ? 'login-logs' : 'activity-logs';
+      a.download = `${prefix}-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.${format}`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(url);
+      setNotice(`Đã xuất nhật ký ${format.toUpperCase()} thành công!`);
+    } catch (err) {
+      setNotice('Xuất nhật ký thất bại: ' + (err.response?.data?.detail || err.message));
+    }
+  }
+
+  async function clearOldLogs(days = 30, category = null) {
+    const msg = days
+      ? `Xóa toàn bộ nhật ký cũ hơn ${days} ngày?`
+      : 'Xóa toàn bộ nhật ký đang hiển thị? Thao tác này không thể hoàn tác.';
+    if (!window.confirm(msg)) return;
+    try {
+      const params = {};
+      if (days) params.days = days;
+      if (category) params.category = category;
+      const { data } = await api.delete('/admin/logs', { params });
+      setNotice(`Đã dọn dẹp ${data.deleted_count} bản ghi nhật ký.`);
+      if (tab === 'logins') {
+        fetchLoginSummary();
+        fetchLogs('auth');
+      } else {
+        fetchLogs('');
+      }
+    } catch (err) {
+      setNotice(err.response?.data?.detail || 'Không thể xóa nhật ký.');
+    }
+  }
+
+  useEffect(() => {
+    if (me?.role === 'admin' && (tab === 'logins' || tab === 'logs')) {
+      fetchLogs(tab === 'logins' ? 'auth' : '');
+    }
+  }, [logFilterUser, logFilterAction, logFilterStatus, logFilterDays, logQuery]);
+
   async function fetchStorageStats() {
     try {
       const { data } = await api.get('/admin/storage-stats');
@@ -502,10 +659,11 @@ function App() {
     } catch {}
   }
 
-  async function refresh() {
+  async function refresh(isPoll = false) {
     try {
       const params = { limit: 300, q: query || undefined };
       if (userFilter != null) params.user_id = userFilter;
+      if (isPoll) params.poll = 1;
       const { data } = await api.get('/scans', { params });
       setScans(data);
       if (selected) {
@@ -652,6 +810,73 @@ function App() {
     }
   }
 
+  async function toggleUserStatus(user) {
+    const nextActive = user.is_active === false;
+    try {
+      const { data: updatedUser } = await api.put(`/users/${user.id}/status`, { is_active: nextActive });
+      setUsers(prev => prev.map(x => (x.id === user.id ? updatedUser : x)));
+      setNotice(
+        nextActive
+          ? `Đã kích hoạt lại tài khoản "${user.username}".`
+          : `Đã tạm dừng hoạt động tài khoản "${user.username}". Người dùng sẽ không thể đăng nhập hoặc thao tác.`
+      );
+    } catch (err) {
+      setNotice(err.response?.data?.detail || 'Không thể thay đổi trạng thái tài khoản.');
+    }
+  }
+
+  async function confirmDeleteUser(userId) {
+    setDeletingUser(true);
+    try {
+      const { data } = await api.delete(`/users/${userId}`);
+      setNotice(`Đã xóa vĩnh viễn tài khoản "${data.username}" (đã dọn ${data.deleted_scans} tệp quét, giải phóng ${fmt(data.freed_bytes)}).`);
+      setConfirmDeleteUserId(null);
+      openUsers();
+      fetchStorageStats();
+      refresh(false);
+    } catch (err) {
+      setNotice(err.response?.data?.detail || 'Không thể xóa tài khoản.');
+    } finally {
+      setDeletingUser(false);
+    }
+  }
+
+  function startResetPassword(user) {
+    setResetPassUserId(user.id);
+    setResetPassVal('');
+    setShowResetPass(false);
+  }
+
+  function generateRandomPassword() {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*';
+    let pwd = '';
+    const array = new Uint32Array(16);
+    window.crypto.getRandomValues(array);
+    for (let i = 0; i < 16; i++) {
+      pwd += chars[array[i] % chars.length];
+    }
+    setResetPassVal(pwd);
+    setShowResetPass(true);
+  }
+
+  async function saveResetPassword(userId) {
+    if (!resetPassVal || resetPassVal.length < 12) {
+      setNotice('Mật khẩu mới phải có ít nhất 12 ký tự.');
+      return;
+    }
+    setResettingPass(true);
+    try {
+      const { data } = await api.put(`/users/${userId}/password`, { new_password: resetPassVal });
+      setNotice(data.message || 'Đã đặt lại mật khẩu thành công.');
+      setResetPassUserId(null);
+      setResetPassVal('');
+    } catch (err) {
+      setNotice(err.response?.data?.detail || 'Không thể đặt lại mật khẩu.');
+    } finally {
+      setResettingPass(false);
+    }
+  }
+
   async function openSettings() {
     setTab('settings');
     setSelected(null);
@@ -717,6 +942,12 @@ function App() {
             <button className={tab === 'users' ? 'nav active' : 'nav'} onClick={openUsers}>
               <Users size={17} /> Người dùng
             </button>
+            <button className={tab === 'logins' ? 'nav active' : 'nav'} onClick={openLogins}>
+              <Lock size={17} /> Quản lý Đăng nhập
+            </button>
+            <button className={tab === 'logs' ? 'nav active' : 'nav'} onClick={openLogs}>
+              <ScrollText size={17} /> Nhật ký hoạt động
+            </button>
             <button className={tab === 'settings' ? 'nav active' : 'nav'} onClick={openSettings}>
               <Settings size={17} /> Cài đặt hệ thống
             </button>
@@ -738,18 +969,26 @@ function App() {
             <h2>
               {selected
                 ? selected.original_name
-                : ({ overview: 'Tổng quan hệ thống', upload: 'Tải lên mẫu phân tích', history: 'Lịch sử phân tích', users: 'Quản lý tài khoản', settings: 'Cài đặt hệ thống & Giới hạn lưu trữ' }[tab] || 'Analysis')}
+                : ({
+                    overview: 'Tổng quan hệ thống',
+                    upload: 'Tải lên mẫu phân tích',
+                    history: 'Lịch sử phân tích',
+                    users: 'Quản lý tài khoản',
+                    logins: 'Quản lý Đăng nhập & Bảo mật',
+                    logs: 'Nhật ký hoạt động người dùng',
+                    settings: 'Cài đặt hệ thống & Giới hạn lưu trữ'
+                  }[tab] || 'Analysis')}
             </h2>
           </div>
           <div className="top-actions">
             <span className="live"><i /> HỆ THỐNG TRỰC TUYẾN</span>
-            <button className="icon-btn" onClick={refresh} title="Làm mới"><RefreshCw size={17} /></button>
+            <button className="icon-btn" onClick={() => refresh(false)} title="Làm mới"><RefreshCw size={17} /></button>
           </div>
         </header>
 
         {notice && (
           <div className="notice">
-            {notice}
+            <span>{notice}</span>
             <button onClick={() => setNotice('')}>×</button>
           </div>
         )}
@@ -762,7 +1001,7 @@ function App() {
                 {selected.status === 'completed' && (
                   <button
                     className="primary"
-                    style={{ margin: 0, padding: '7px 14px', fontSize: '11px', display: 'inline-flex', alignItems: 'center', gap: '6px' }}
+                    style={{ margin: 0, padding: '7px 14px', fontSize: '13px', display: 'inline-flex', alignItems: 'center', gap: '6px' }}
                     onClick={() => downloadPdf(selected.id, selected.original_name)}
                     title="Tải về báo cáo phân tích bảo mật định dạng PDF"
                   >
@@ -1138,6 +1377,7 @@ function App() {
                       <th>TÊN ĐĂNG NHẬP</th>
                       <th>EMAIL</th>
                       <th>VAI TRÒ</th>
+                      <th>TRẠNG THÁI</th>
                       <th>GIỚI HẠN UPLOAD</th>
                       <th>NGÀY TẠO</th>
                       <th>SỐ TỆP ĐÃ TẢI LÊN</th>
@@ -1146,17 +1386,31 @@ function App() {
                     </tr>
                   </thead>
                   <tbody>
-                    {users.map(u => (
-                      <tr key={u.id}>
+                    {users.map(u => {
+                      const isActive = u.is_active !== false;
+                      const isSelf = me && me.id === u.id;
+                      return (
+                      <React.Fragment key={u.id}>
+                      <tr style={!isActive ? { opacity: 0.72, background: '#17121b' } : undefined}>
                         <td>
                           <b>
-                            <span className="user-badge" style={{ fontSize: '12px' }}>
+                            <span className="user-badge" style={{ fontSize: '13.5px' }}>
                               <User size={13} /> {u.username}
                             </span>
+                            {u.is_active === false && (
+                              <span key="paused-tag" className="pill failed" style={{ marginLeft: '6px', padding: '2px 6px', fontSize: '11px' }}>Tạm dừng</span>
+                            )}
                           </b>
                         </td>
                         <td>{u.email}</td>
                         <td><span className="pill">{u.role}</span></td>
+                        <td>
+                          {isActive ? (
+                            <span key="status-active" className="pill completed">Hoạt động</span>
+                          ) : (
+                            <span key="status-paused" className="pill failed">Tạm dừng</span>
+                          )}
+                        </td>
                         <td>
                           {editingUserId === u.id ? (
                             <div className="inline-limit-box" onClick={e => e.stopPropagation()}>
@@ -1208,7 +1462,7 @@ function App() {
                               <button
                                 type="button"
                                 className="text-btn icon-edit-btn"
-                                style={{ color: '#a78bfa', padding: '2px 5px', fontSize: '11px', display: 'inline-flex', alignItems: 'center', gap: '3px' }}
+                                style={{ color: '#a78bfa', padding: '2px 5px', fontSize: '13px', display: 'inline-flex', alignItems: 'center', gap: '3px' }}
                                 onClick={() => startEditLimit(u)}
                                 title="Sửa giới hạn trực tiếp trên bảng"
                               >
@@ -1225,12 +1479,12 @@ function App() {
                         </td>
                         <td><b>{fmt(u.total_upload_size || 0)}</b></td>
                         <td style={{ textAlign: 'center' }}>
-                          <div style={{ display: 'inline-flex', gap: '8px' }}>
+                          <div style={{ display: 'inline-flex', gap: '8px', flexWrap: 'wrap', justifyContent: 'center' }}>
                             {editingUserId === u.id ? (
                               <button
                                 type="button"
                                 className="text-btn"
-                                style={{ color: '#94a3b8', fontSize: '11px' }}
+                                style={{ color: '#94a3b8', fontSize: '13px' }}
                                 onClick={() => setEditingUserId(null)}
                               >
                                 Đang sửa…
@@ -1239,7 +1493,7 @@ function App() {
                               <button
                                 type="button"
                                 className="text-btn"
-                                style={{ color: '#a78bfa', fontSize: '11px', fontWeight: 600 }}
+                                style={{ color: '#a78bfa', fontSize: '13px', fontWeight: 600 }}
                                 onClick={() => startEditLimit(u)}
                                 title="Chỉnh sửa hạn mức tải lên trực tiếp"
                               >
@@ -1247,8 +1501,37 @@ function App() {
                               </button>
                             )}
                             <button
+                              type="button"
                               className="text-btn"
-                              style={{ color: '#38bdf8', fontSize: '11px', fontWeight: 600 }}
+                              style={{ color: '#fbbf24', fontSize: '13px', fontWeight: 600, display: 'inline-flex', alignItems: 'center', gap: '3px' }}
+                              onClick={() => resetPassUserId === u.id ? setResetPassUserId(null) : startResetPassword(u)}
+                              title="Đặt lại mật khẩu mới trực tiếp cho người dùng này"
+                            >
+                              <Key size={11} /> {resetPassUserId === u.id ? 'Đóng' : 'Reset pass'}
+                            </button>
+                            {!isSelf && (
+                              <button
+                                key={isActive ? 'suspend-btn' : 'activate-btn'}
+                                type="button"
+                                className="text-btn"
+                                style={{
+                                  color: isActive ? '#fb923c' : '#4ade80',
+                                  fontSize: '13px',
+                                  fontWeight: 600,
+                                  display: 'inline-flex',
+                                  alignItems: 'center',
+                                  gap: '3px'
+                                }}
+                                onClick={() => toggleUserStatus(u)}
+                                title={isActive ? 'Tạm dừng hoạt động tài khoản này' : 'Kích hoạt lại tài khoản này'}
+                              >
+                                {isActive ? <PauseCircle size={11} /> : <PlayCircle size={11} />}
+                                <span>{isActive ? 'Tạm dừng' : 'Kích hoạt'}</span>
+                              </button>
+                            )}
+                            <button
+                              className="text-btn"
+                              style={{ color: '#38bdf8', fontSize: '13px', fontWeight: 600 }}
                               onClick={() => {
                                 setUserFilter(u.id);
                                 setTab('history');
@@ -1260,17 +1543,132 @@ function App() {
                             {(u.upload_count > 0) && (
                               <button
                                 className="text-btn"
-                                style={{ color: '#f87171', fontSize: '11px', fontWeight: 600 }}
+                                style={{ color: '#f87171', fontSize: '13px', fontWeight: 600 }}
                                 onClick={() => runCleanup('user', null, u.id)}
                                 title="Xóa toàn bộ các tệp tin của người dùng này"
                               >
                                 Dọn dẹp files
                               </button>
                             )}
+                            {!isSelf && (
+                              <button
+                                type="button"
+                                className="text-btn"
+                                style={{ color: '#ef4444', fontSize: '13px', fontWeight: 600, display: 'inline-flex', alignItems: 'center', gap: '3px' }}
+                                onClick={() => setConfirmDeleteUserId(confirmDeleteUserId === u.id ? null : u.id)}
+                                title="Xóa vĩnh viễn tài khoản người dùng này"
+                              >
+                                <Trash2 size={11} /> Xóa
+                              </button>
+                            )}
                           </div>
                         </td>
                       </tr>
-                    ))}
+                      {confirmDeleteUserId === u.id && (
+                        <tr className="inline-delete-row">
+                          <td colSpan="9">
+                            <div className="inline-reset-panel">
+                              <span className="inline-reset-label" style={{ color: '#fca5a5' }}>
+                                <AlertTriangle size={14} className="red" />
+                                Xác nhận xóa vĩnh viễn tài khoản <b>{u.username}</b> ({u.upload_count || 0} tệp tin sẽ bị xóa khỏi đĩa)?
+                              </span>
+                              <button
+                                type="button"
+                                className="btn-danger"
+                                style={{ padding: '4px 10px', fontSize: '13px' }}
+                                onClick={() => confirmDeleteUser(u.id)}
+                                disabled={deletingUser}
+                              >
+                                <Trash2 size={12} /> {deletingUser ? 'Đang xóa…' : 'Xác nhận xóa'}
+                              </button>
+                              <button
+                                type="button"
+                                className="btn-inline-cancel"
+                                onClick={() => setConfirmDeleteUserId(null)}
+                                disabled={deletingUser}
+                              >
+                                <X size={12} /> Hủy
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                      {resetPassUserId === u.id && (
+                        <tr className="inline-reset-row">
+                          <td colSpan="9">
+                            <div className="inline-reset-panel">
+                              <span className="inline-reset-label">
+                                <Key size={13} className="amber" /> Đặt lại mật khẩu cho <b>{u.username}</b>:
+                              </span>
+                              <div className="inline-pass-input-wrap">
+                                <input
+                                  type={showResetPass ? 'text' : 'password'}
+                                  minLength="12"
+                                  className="inline-pass-input"
+                                  placeholder="Nhập mật khẩu mới (tối thiểu 12 ký tự)…"
+                                  value={resetPassVal}
+                                  onChange={e => setResetPassVal(e.target.value)}
+                                  onKeyDown={e => {
+                                    if (e.key === 'Enter') saveResetPassword(u.id);
+                                    if (e.key === 'Escape') setResetPassUserId(null);
+                                  }}
+                                  autoFocus
+                                />
+                                <button
+                                  type="button"
+                                  className="inline-icon-toggle"
+                                  onClick={() => setShowResetPass(v => !v)}
+                                  title={showResetPass ? 'Ẩn mật khẩu' : 'Hiện mật khẩu'}
+                                >
+                                  {showResetPass ? <EyeOff size={13} /> : <Eye size={13} />}
+                                </button>
+                              </div>
+                              <button
+                                type="button"
+                                className="btn-inline-gen"
+                                onClick={generateRandomPassword}
+                                title="Tạo mật khẩu mạnh ngẫu nhiên 16 ký tự"
+                              >
+                                <RefreshCw size={11} /> Tạo ngẫu nhiên
+                              </button>
+                              {resetPassVal && (
+                                <button
+                                  type="button"
+                                  className="btn-inline-copy"
+                                  onClick={() => {
+                                    navigator.clipboard?.writeText(resetPassVal);
+                                    setNotice('Đã sao chép mật khẩu mới vào clipboard.');
+                                  }}
+                                  title="Sao chép mật khẩu"
+                                >
+                                  <Copy size={11} /> Copy
+                                </button>
+                              )}
+                              <button
+                                type="button"
+                                className="btn-inline-save"
+                                onClick={() => saveResetPassword(u.id)}
+                                disabled={resettingPass || resetPassVal.length < 12}
+                                title="Lưu mật khẩu mới (Enter)"
+                              >
+                                <Check size={12} /> {resettingPass ? 'Đang lưu…' : 'Lưu mật khẩu'}
+                              </button>
+                              <button
+                                type="button"
+                                className="btn-inline-cancel"
+                                onClick={() => setResetPassUserId(null)}
+                                disabled={resettingPass}
+                                title="Hủy bỏ (Esc)"
+                              >
+                                <X size={12} /> Hủy
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                      </React.Fragment>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -1278,7 +1676,7 @@ function App() {
           </section>
         ) : tab === 'settings' ? (
           <section className="content">
-            <div className="panel" style={{ maxWidth: '820px' }}>
+            <div className="panel">
               <div className="panel-head">
                 <div>
                   <span className="eyebrow">QUẢN TRỊ HỆ THỐNG</span>
@@ -1373,25 +1771,25 @@ function App() {
                 </div>
 
                 {storageStats && (
-                  <div className="storage-info-grid" style={{ gridTemplateColumns: 'repeat(4, 1fr)', marginTop: '14px' }}>
+                  <div className="storage-info-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))', marginTop: '14px' }}>
                     <div className="storage-box">
                       <small>TỔNG SỐ MẪU QUÉT</small>
-                      <b style={{ fontSize: '18px', color: '#38bdf8' }}>{storageStats.total_scans}</b>
+                      <b style={{ fontSize: '20px', color: '#38bdf8' }}>{storageStats.total_scans}</b>
                       <span className="muted small">Trong cơ sở dữ liệu</span>
                     </div>
                     <div className="storage-box">
                       <small>DUNG LƯỢNG TRONG DB</small>
-                      <b style={{ fontSize: '18px', color: '#4ade80' }}>{fmt(storageStats.total_db_size)}</b>
+                      <b style={{ fontSize: '20px', color: '#4ade80' }}>{fmt(storageStats.total_db_size)}</b>
                       <span className="muted small">Tổng kích thước mẫu</span>
                     </div>
                     <div className="storage-box">
                       <small>TỆP TRÊN ĐĨA MÁY CHỦ</small>
-                      <b style={{ fontSize: '18px', color: '#facc15' }}>{storageStats.disk_files_count} files</b>
+                      <b style={{ fontSize: '20px', color: '#facc15' }}>{storageStats.disk_files_count} files</b>
                       <span className="muted small">Thực tế: {fmt(storageStats.disk_used_bytes)}</span>
                     </div>
                     <div className="storage-box">
                       <small>TỆP RÁC MỒ CÔI (ORPHANS)</small>
-                      <b style={{ fontSize: '18px', color: storageStats.orphan_files_count > 0 ? '#f87171' : '#94a3b8' }}>
+                      <b style={{ fontSize: '20px', color: storageStats.orphan_files_count > 0 ? '#f87171' : '#94a3b8' }}>
                         {storageStats.orphan_files_count} files
                       </b>
                       <span className="muted small">Không thuộc mẫu nào</span>
@@ -1440,7 +1838,7 @@ function App() {
                     </button>
                   </div>
 
-                  <div className="cleanup-card" style={{ gridColumn: 'span 2', borderColor: '#5e1b24', background: '#160b10' }}>
+                  <div className="cleanup-card" style={{ gridColumn: '1 / -1', borderColor: '#5e1b24', background: '#160b10' }}>
                     <div>
                       <h5 style={{ color: '#f87171' }}><AlertTriangle size={16} className="red" /> Xóa toàn bộ tệp tin (Storage Reset)</h5>
                       <p style={{ color: '#fca5a5' }}>
@@ -1452,6 +1850,280 @@ function App() {
                     </button>
                   </div>
                 </div>
+              </div>
+            </div>
+          </section>
+        ) : tab === 'logins' ? (
+          <section className="content">
+            <div className="stats">
+              <Stat icon={<CheckCircle2 />} label="Đăng nhập thành công (24h)" value={loginSummary?.login_success_24h ?? 0} color="green" />
+              <Stat icon={<ShieldAlert />} label="Đăng nhập thất bại (24h)" value={loginSummary?.login_failed_24h ?? 0} color="red" />
+              <Stat icon={<Users />} label="Tài khoản hoạt động (24h)" value={loginSummary?.active_users_24h ?? 0} color="blue" />
+              <Stat icon={<Lock />} label="Tổng lượt đăng nhập" value={loginSummary?.total_logins ?? 0} color="amber" />
+            </div>
+
+            <div className="panel">
+              <div className="panel-head">
+                <div>
+                  <span className="eyebrow">PHIÊN TRUY CẬP TÀI KHOẢN</span>
+                  <h3>Tình trạng đăng nhập theo người dùng</h3>
+                </div>
+                <button className="icon-btn" onClick={() => { fetchLoginSummary(); fetchLogs('auth'); }} title="Làm mới dữ liệu">
+                  <RefreshCw size={16} />
+                </button>
+              </div>
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>TÀI KHOẢN</th>
+                      <th>VAI TRÒ</th>
+                      <th>ĐĂNG NHẬP GẦN NHẤT</th>
+                      <th>ĐỊA CHỈ IP GẦN NHẤT</th>
+                      <th>THIẾT BỊ / TRÌNH DUYỆT</th>
+                      <th>THÀNH CÔNG</th>
+                      <th>THẤT BẠI</th>
+                      <th style={{ textAlign: 'center' }}>THAO TÁC</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(loginSummary?.user_sessions || []).map(u => (
+                      <tr key={u.id}>
+                        <td>
+                          <b>
+                            <span className="user-badge" style={{ fontSize: '13.5px' }}>
+                              <User size={13} /> {u.username}
+                            </span>
+                            {u.is_active === false && (
+                              <span className="pill failed" style={{ marginLeft: '6px', padding: '2px 6px', fontSize: '11px' }}>Tạm dừng</span>
+                            )}
+                          </b>
+                        </td>
+                        <td><span className="pill">{u.role}</span></td>
+                        <td>{u.last_login_at ? date(u.last_login_at) : <span className="muted">Chưa đăng nhập</span>}</td>
+                        <td className="mono">{u.last_login_ip || '—'}</td>
+                        <td style={{ maxWidth: '240px', overflow: 'hidden', textOverflow: 'ellipsis' }} title={u.last_login_ua || ''}>
+                          <span className="muted small">{u.last_login_ua || '—'}</span>
+                        </td>
+                        <td>
+                          <span className="pill completed">{u.login_count} lần</span>
+                        </td>
+                        <td>
+                          {u.failed_count > 0 ? (
+                            <span className="pill failed"><b>{u.failed_count} lần</b></span>
+                          ) : (
+                            <span className="muted">0</span>
+                          )}
+                        </td>
+                        <td style={{ textAlign: 'center' }}>
+                          <div style={{ display: 'inline-flex', gap: '8px', flexWrap: 'wrap', justifyContent: 'center' }}>
+                            <button
+                              className="text-btn"
+                              style={{ color: '#38bdf8', fontSize: '13px', fontWeight: 600 }}
+                              onClick={() => setLogFilterUser(String(u.id))}
+                            >
+                              Lọc log login
+                            </button>
+                            <button
+                              className="text-btn"
+                              style={{ color: '#fbbf24', fontSize: '13px', fontWeight: 600 }}
+                              onClick={() => { openUsers(); startResetPassword(u); }}
+                            >
+                              Reset pass
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <div className="panel">
+              <div className="panel-head">
+                <div>
+                  <span className="eyebrow">LỊCH SỬ XÁC THỰC (AUTH AUDIT)</span>
+                  <h3>Chi tiết đăng nhập &amp; đăng xuất ({logs.length})</h3>
+                </div>
+                <div className="audit-actions">
+                  <button className="btn-export csv" onClick={() => exportLogs('csv', 'auth')}>
+                    <Download size={14} /> Xuất CSV
+                  </button>
+                  <button className="btn-export json" onClick={() => exportLogs('json', 'auth')}>
+                    <Download size={14} /> Xuất JSON
+                  </button>
+                  <button className="btn-danger-outline" onClick={() => clearOldLogs(30, 'auth')}>
+                    <Trash2 size={13} /> Xóa log &gt; 30 ngày
+                  </button>
+                </div>
+              </div>
+
+              <div className="audit-filter-bar">
+                <select className="user-filter-select" value={logFilterUser} onChange={e => setLogFilterUser(e.target.value)}>
+                  <option value="">Tất cả tài khoản</option>
+                  {users.map(u => <option key={u.id} value={u.id}>{u.username}</option>)}
+                </select>
+                <select className="user-filter-select" value={logFilterAction} onChange={e => setLogFilterAction(e.target.value)}>
+                  <option value="">Tất cả sự kiện Login</option>
+                  <option value="LOGIN_SUCCESS">Đăng nhập thành công</option>
+                  <option value="LOGIN_FAILED">Đăng nhập thất bại</option>
+                  <option value="LOGOUT">Đăng xuất</option>
+                </select>
+                <select className="user-filter-select" value={logFilterStatus} onChange={e => setLogFilterStatus(e.target.value)}>
+                  <option value="">Mọi trạng thái</option>
+                  <option value="success">Thành công</option>
+                  <option value="failed">Thất bại</option>
+                </select>
+                <div className="search small-search">
+                  <Search size={14} />
+                  <input placeholder="Tìm theo username, IP, thiết bị…" value={logQuery} onChange={e => setLogQuery(e.target.value)} />
+                </div>
+              </div>
+
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>THỜI GIAN</th>
+                      <th>TÀI KHOẢN</th>
+                      <th>SỰ KIỆN</th>
+                      <th>TRẠNG THÁI</th>
+                      <th>ĐỊA CHỈ IP</th>
+                      <th>TRÌNH DUYỆT / USER-AGENT</th>
+                      <th>CHI TIẾT</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {logs.map(l => (
+                      <tr key={l.id} className={l.status === 'failed' ? 'row-warning' : ''}>
+                        <td className="mono">{date(l.created_at)}</td>
+                        <td>
+                          <span className="user-badge"><User size={12} /> {l.username}</span>
+                        </td>
+                        <td><b>{ACTION_LABELS[l.action] || l.action}</b></td>
+                        <td>
+                          <span className={`pill ${l.status === 'success' ? 'completed' : 'failed'}`}>
+                            {l.status === 'success' ? 'Thành công' : 'Thất bại'}
+                          </span>
+                        </td>
+                        <td className="mono"><Globe size={12} style={{ verticalAlign: 'middle', marginRight: '4px', color: '#7dd3fc' }} />{l.ip_address || '—'}</td>
+                        <td style={{ maxWidth: '240px', overflow: 'hidden', textOverflow: 'ellipsis' }} title={l.user_agent || ''}>
+                          <span className="muted small">{l.user_agent || '—'}</span>
+                        </td>
+                        <td>{l.details || '—'}</td>
+                      </tr>
+                    ))}
+                    {!logs.length && (
+                      <tr>
+                        <td colSpan="7" className="empty">
+                          {logsLoading ? 'Đang tải dữ liệu...' : 'Chưa có dữ liệu đăng nhập nào phù hợp bộ lọc.'}
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+        ) : tab === 'logs' ? (
+          <section className="content">
+            <div className="panel">
+              <div className="panel-head">
+                <div>
+                  <span className="eyebrow">GIÁM SÁT HỆ THỐNG (ACTIVITY AUDIT)</span>
+                  <h3>Nhật ký hoạt động người dùng ({logs.length})</h3>
+                </div>
+                <div className="audit-actions">
+                  <button className="btn-export csv" onClick={() => exportLogs('csv', null)}>
+                    <Download size={14} /> Xuất CSV (Excel)
+                  </button>
+                  <button className="btn-export json" onClick={() => exportLogs('json', null)}>
+                    <Download size={14} /> Xuất JSON
+                  </button>
+                  <button className="btn-danger-outline" onClick={() => clearOldLogs(30, null)}>
+                    <Trash2 size={13} /> Xóa log &gt; 30 ngày
+                  </button>
+                  <button className="icon-btn" onClick={() => fetchLogs('')} title="Làm mới">
+                    <RefreshCw size={16} />
+                  </button>
+                </div>
+              </div>
+
+              <div className="audit-filter-bar">
+                <select className="user-filter-select" value={logFilterUser} onChange={e => setLogFilterUser(e.target.value)}>
+                  <option value="">Tất cả người dùng</option>
+                  {users.map(u => <option key={u.id} value={u.id}>{u.username}</option>)}
+                </select>
+                <select className="user-filter-select" value={logFilterAction} onChange={e => setLogFilterAction(e.target.value)}>
+                  <option value="">Tất cả hành động</option>
+                  {Object.entries(ACTION_LABELS).map(([k, v]) => (
+                    <option key={k} value={k}>{v}</option>
+                  ))}
+                </select>
+                <select className="user-filter-select" value={logFilterStatus} onChange={e => setLogFilterStatus(e.target.value)}>
+                  <option value="">Mọi trạng thái</option>
+                  <option value="success">Thành công</option>
+                  <option value="failed">Thất bại</option>
+                </select>
+                <select className="user-filter-select" value={logFilterDays} onChange={e => setLogFilterDays(e.target.value)}>
+                  <option value="">Tất cả thời gian</option>
+                  <option value="1">24 giờ qua</option>
+                  <option value="7">7 ngày qua</option>
+                  <option value="30">30 ngày qua</option>
+                </select>
+                <div className="search small-search">
+                  <Search size={14} />
+                  <input placeholder="Tìm user, IP, tên file, chi tiết…" value={logQuery} onChange={e => setLogQuery(e.target.value)} />
+                </div>
+              </div>
+
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>THỜI GIAN</th>
+                      <th>NGƯỜI DÙNG</th>
+                      <th>HÀNH ĐỘNG</th>
+                      <th>TRẠNG THÁI</th>
+                      <th>ĐỊA CHỈ IP</th>
+                      <th>ĐỐI TƯỢNG</th>
+                      <th>CHI TIẾT HOẠT ĐỘNG</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {logs.map(l => (
+                      <tr key={l.id} className={l.status === 'failed' ? 'row-warning' : ''}>
+                        <td className="mono">{date(l.created_at)}</td>
+                        <td>
+                          <span className="user-badge"><User size={12} /> {l.username}</span>
+                        </td>
+                        <td>
+                          <span className={`pill action-pill ${l.category}`}>
+                            {ACTION_LABELS[l.action] || l.action}
+                          </span>
+                        </td>
+                        <td>
+                          <span className={`pill ${l.status === 'success' ? 'completed' : 'failed'}`}>
+                            {l.status === 'success' ? 'Thành công' : 'Thất bại'}
+                          </span>
+                        </td>
+                        <td className="mono">{l.ip_address || '—'}</td>
+                        <td className="mono" style={{ maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis' }} title={l.target || ''}>
+                          {l.target || '—'}
+                        </td>
+                        <td style={{ whiteSpace: 'normal', minWidth: '220px' }}>{l.details || '—'}</td>
+                      </tr>
+                    ))}
+                    {!logs.length && (
+                      <tr>
+                        <td colSpan="7" className="empty">
+                          {logsLoading ? 'Đang tải dữ liệu...' : 'Không có bản ghi hoạt động nào phù hợp bộ lọc.'}
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
               </div>
             </div>
           </section>

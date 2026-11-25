@@ -15,11 +15,18 @@ class UserCreate(BaseModel):
 class UserLimitUpdate(BaseModel):
     max_upload_mb: int | None = None
 
+class UserPasswordReset(BaseModel):
+    new_password: str
+
+class UserStatusUpdate(BaseModel):
+    is_active: bool
+
 class UserView(BaseModel):
     id: int
     username: str
     email: str
     role: str
+    is_active: bool = True
     created_at: datetime
     upload_count: int = 0
     total_upload_size: int = 0
@@ -66,4 +73,38 @@ class StorageStatsView(BaseModel):
     disk_used_bytes: int
     orphan_files_count: int
     status_counts: dict[str, int]
+
+class ActivityLogView(BaseModel):
+    id: int
+    user_id: int | None = None
+    username: str
+    action: str
+    category: str
+    status: str
+    ip_address: str | None = None
+    user_agent: str | None = None
+    target: str | None = None
+    details: str | None = None
+    created_at: datetime
+    model_config = ConfigDict(from_attributes=True)
+
+class UserLoginSummaryItem(BaseModel):
+    id: int
+    username: str
+    email: str
+    role: str
+    is_active: bool = True
+    last_login_at: datetime | None = None
+    last_login_ip: str | None = None
+    last_login_ua: str | None = None
+    login_count: int = 0
+    failed_count: int = 0
+
+class LoginSummaryView(BaseModel):
+    total_logs: int
+    login_success_24h: int
+    login_failed_24h: int
+    active_users_24h: int
+    total_logins: int
+    user_sessions: list[UserLoginSummaryItem]
 

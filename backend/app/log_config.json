@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "disable_existing_loggers": false,
+  "filters": {
+    "noise_filter": {
+      "()": "app.logging_config.NoiseFilter"
+    }
+  },
+  "formatters": {
+    "default": {
+      "()": "app.logging_config.LocalTimeDefaultFormatter",
+      "fmt": "%(asctime)s | %(levelprefix)s %(message)s",
+      "datefmt": "%Y-%m-%d %H:%M:%S"
+    },
+    "access": {
+      "()": "app.logging_config.LocalTimeAccessFormatter",
+      "fmt": "%(asctime)s | %(levelprefix)s %(client_addr)s - \"%(request_line)s\" %(status_code)s",
+      "datefmt": "%Y-%m-%d %H:%M:%S"
+    }
+  },
+  "handlers": {
+    "default": {
+      "formatter": "default",
+      "class": "logging.StreamHandler",
+      "stream": "ext://sys.stderr"
+    },
+    "access": {
+      "formatter": "access",
+      "class": "logging.StreamHandler",
+      "stream": "ext://sys.stdout",
+      "filters": ["noise_filter"]
+    }
+  },
+  "loggers": {
+    "uvicorn": {
+      "handlers": ["default"],
+      "level": "INFO",
+      "propagate": false
+    },
+    "uvicorn.error": {
+      "level": "INFO"
+    },
+    "uvicorn.access": {
+      "handlers": ["access"],
+      "level": "INFO",
+      "propagate": false
+    }
+  }
+}

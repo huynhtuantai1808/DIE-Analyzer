@@ -34,6 +34,11 @@ def current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_
     user = db.get(User, user_id)
     if not user:
         raise unauthorized
+    if not getattr(user, "is_active", True):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Tài khoản của bạn đang bị tạm dừng hoạt động. Vui lòng liên hệ Administrator."
+        )
     return user
 
 def admin_user(user: User = Depends(current_user)) -> User:
