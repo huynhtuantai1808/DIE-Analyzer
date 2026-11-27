@@ -14,13 +14,13 @@ from sqlalchemy import func, text
 from sqlalchemy.orm import Session, joinedload
 from redis import Redis
 from rq import Queue
-from .config import UPLOAD_DIR, MAX_UPLOAD_MB, REDIS_URL
+from .config import UPLOAD_DIR, MAX_UPLOAD_MB, REDIS_URL, JWT_EXPIRE_MINUTES
 from .database import Base, engine, get_db, SessionLocal
-from .models import User, Scan, Setting, ActivityLog
+from .models import User, Scan, Setting, ActivityLog, UserSession
 from .schemas import (
     UserCreate, UserLimitUpdate, UserPasswordReset, UserStatusUpdate, UserView, ScanView,
     SettingsView, SettingsUpdate, BatchDeleteRequest, CleanupRequest, StorageStatsView,
-    ActivityLogView, LoginSummaryView, UserLoginSummaryItem
+    ActivityLogView, LoginSummaryView, UserLoginSummaryItem, UserSessionView
 )
 from .security import hash_password, verify_password, create_token, current_user, admin_user
 from .tasks import analyze_scan
@@ -77,6 +77,14 @@ def record_log(
 def get_db_setting(db: Session, key: str, default: str) -> str:
     s = db.get(Setting, key)
     return s.value if s else default
+
+def _revoke_user_sessions(db: Session, user_id: int) -> int:
+    now = datetime.now(timezone.utc)
+    return (
+        db.query(UserSession)
+        .filter(UserSession.user_id == user_id, UserSession.is_revoked == False)  # noqa: E712
+        .update({UserSession.is_revoked: True, UserSession.revoked_at: now}, synchronize_session=False)
+    )
 
 @app.on_event("startup")
 def startup():
@@ -138,6 +146,22 @@ def login(request: Request, form: OAuth2PasswordRequestForm = Depends(), db: Ses
             status_code=403,
             detail="Tài khoản của bạn đã bị tạm dừng hoạt động. Vui lòng liên hệ Administrator."
         )
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(minutes=JWT_EXPIRE_MINUTES)
+    jti = uuid.uuid4().hex
+    db_session = UserSession(
+        jti=jti,
+        user_id=user.id,
+        ip_address=get_client_ip(request),
+        user_agent=(request.headers.get("user-agent") or "")[:512],
+        is_revoked=False,
+        created_at=now,
+        last_seen_at=now,
+        expires_at=expires_at,
+    )
+    db.add(db_session)
+    db.commit()
+
     record_log(
         db,
         user_id=user.id,
@@ -149,11 +173,19 @@ def login(request: Request, form: OAuth2PasswordRequestForm = Depends(), db: Ses
         target=user.username,
         details=f"Đăng nhập thành công ({user.role})",
     )
-    return {"access_token": create_token(user), "token_type": "bearer",
+    return {"access_token": create_token(user, jti=jti, expires=expires_at), "token_type": "bearer",
             "user": {"id": user.id, "username": user.username, "role": user.role}}
 
 @app.post("/api/auth/logout")
 def logout_endpoint(request: Request, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    jti = getattr(user, "_session_jti", None)
+    if jti:
+        now = datetime.now(timezone.utc)
+        db.query(UserSession).filter(UserSession.jti == jti, UserSession.user_id == user.id).update(
+            {UserSession.is_revoked: True, UserSession.revoked_at: now},
+            synchronize_session=False,
+        )
+        db.commit()
     record_log(
         db,
         user_id=user.id,
@@ -301,6 +333,7 @@ def update_user_status(request: Request, user_id: int, payload: UserStatusUpdate
     if target_user.id == admin.id and not payload.is_active:
         raise HTTPException(400, "Không thể tự tạm dừng tài khoản quản trị đang đăng nhập")
     target_user.is_active = payload.is_active
+    revoked_cnt = _revoke_user_sessions(db, user_id) if not payload.is_active else 0
     db.commit()
     db.refresh(target_user)
     record_log(
@@ -312,7 +345,8 @@ def update_user_status(request: Request, user_id: int, payload: UserStatusUpdate
         status="success",
         request=request,
         target=target_user.username,
-        details=f"{'Kích hoạt lại' if payload.is_active else 'Tạm dừng hoạt động'} tài khoản '{target_user.username}'",
+        details=f"{'Kích hoạt lại' if payload.is_active else 'Tạm dừng hoạt động'} tài khoản '{target_user.username}'"
+        + (f" (thu hồi {revoked_cnt} phiên)" if revoked_cnt else ""),
     )
     default_limit = int(get_db_setting(db, "max_upload_mb", str(MAX_UPLOAD_MB)))
     cnt = db.query(func.count(Scan.id)).filter(Scan.user_id == user_id).scalar() or 0
@@ -379,6 +413,7 @@ def reset_user_password(request: Request, user_id: int, payload: UserPasswordRes
     if not payload.new_password or len(payload.new_password) < 12:
         raise HTTPException(400, "Mật khẩu mới phải có ít nhất 12 ký tự")
     target_user.password_hash = hash_password(payload.new_password)
+    revoked_cnt = _revoke_user_sessions(db, user_id)
     db.commit()
     record_log(
         db,
@@ -389,7 +424,8 @@ def reset_user_password(request: Request, user_id: int, payload: UserPasswordRes
         status="success",
         request=request,
         target=target_user.username,
-        details=f"Admin đặt lại mật khẩu cho tài khoản '{target_user.username}'",
+        details=f"Admin đặt lại mật khẩu cho tài khoản '{target_user.username}'"
+        + (f" (đã thu hồi {revoked_cnt} phiên cũ)" if revoked_cnt else ""),
     )
     return {"status": "ok", "message": f"Đã đặt lại mật khẩu cho tài khoản '{target_user.username}'"}
 
@@ -823,6 +859,14 @@ def get_login_summary(db: Session = Depends(get_db), _: User = Depends(admin_use
         elif entry.action == "LOGIN_FAILED":
             stat["failed_count"] += 1
 
+    now = datetime.now(timezone.utc)
+    active_counts = dict(
+        db.query(UserSession.user_id, func.count(UserSession.id))
+        .filter(UserSession.is_revoked == False, UserSession.expires_at > now)  # noqa: E712
+        .group_by(UserSession.user_id)
+        .all()
+    )
+
     user_sessions = []
     for u in users:
         st = by_user.get(u.username, {})
@@ -837,6 +881,7 @@ def get_login_summary(db: Session = Depends(get_db), _: User = Depends(admin_use
             last_login_ua=st.get("last_login_ua"),
             login_count=st.get("login_count", 0),
             failed_count=st.get("failed_count", 0),
+            active_sessions_count=active_counts.get(u.id, 0),
         ))
 
     return LoginSummaryView(
@@ -847,6 +892,104 @@ def get_login_summary(db: Session = Depends(get_db), _: User = Depends(admin_use
         total_logins=total_logins,
         user_sessions=user_sessions,
     )
+
+
+@app.get("/api/admin/sessions", response_model=list[UserSessionView])
+def list_user_sessions(
+    active_only: bool = True,
+    user_id: int | None = None,
+    db: Session = Depends(get_db),
+    admin: User = Depends(admin_user),
+):
+    now = datetime.now(timezone.utc)
+    current_jti = getattr(admin, "_session_jti", None)
+    query = db.query(UserSession).options(joinedload(UserSession.user))
+    if active_only:
+        query = query.filter(UserSession.is_revoked == False, UserSession.expires_at > now)  # noqa: E712
+    if user_id is not None:
+        query = query.filter(UserSession.user_id == user_id)
+    rows = query.order_by(UserSession.last_seen_at.desc()).limit(200).all()
+    return [
+        UserSessionView(
+            id=s.id,
+            jti=s.jti,
+            user_id=s.user_id,
+            username=s.user.username if s.user else "Unknown",
+            role=s.user.role if s.user else "analyst",
+            ip_address=s.ip_address,
+            user_agent=s.user_agent,
+            is_revoked=s.is_revoked,
+            created_at=s.created_at,
+            last_seen_at=s.last_seen_at,
+            expires_at=s.expires_at,
+            revoked_at=s.revoked_at,
+            is_current=(s.jti == current_jti),
+        )
+        for s in rows
+    ]
+
+
+@app.post("/api/admin/sessions/{session_id}/revoke")
+def revoke_single_session(
+    request: Request,
+    session_id: int,
+    db: Session = Depends(get_db),
+    admin: User = Depends(admin_user),
+):
+    session = db.get(UserSession, session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+    if session.jti == getattr(admin, "_session_jti", None):
+        raise HTTPException(400, "Không thể tự thu hồi phiên đăng nhập hiện tại của chính bạn")
+    if not session.is_revoked:
+        session.is_revoked = True
+        session.revoked_at = datetime.now(timezone.utc)
+        db.commit()
+    target_user = db.get(User, session.user_id)
+    uname = target_user.username if target_user else f"user#{session.user_id}"
+    record_log(
+        db,
+        user_id=admin.id,
+        username=admin.username,
+        action="SESSION_REVOKE",
+        category="auth",
+        status="success",
+        request=request,
+        target=uname,
+        details=f"Admin thu hồi phiên đăng nhập #{session_id} của '{uname}' (IP: {session.ip_address or '—'})",
+    )
+    return {"revoked": True, "session_id": session_id}
+
+
+@app.post("/api/admin/users/{user_id}/revoke-sessions")
+def revoke_all_user_sessions(
+    request: Request,
+    user_id: int,
+    db: Session = Depends(get_db),
+    admin: User = Depends(admin_user),
+):
+    target_user = db.get(User, user_id)
+    if not target_user:
+        raise HTTPException(404, "User not found")
+    now = datetime.now(timezone.utc)
+    current_jti = getattr(admin, "_session_jti", None)
+    query = db.query(UserSession).filter(UserSession.user_id == user_id, UserSession.is_revoked == False)  # noqa: E712
+    if user_id == admin.id and current_jti:
+        query = query.filter(UserSession.jti != current_jti)
+    revoked_count = query.update({UserSession.is_revoked: True, UserSession.revoked_at: now}, synchronize_session=False)
+    db.commit()
+    record_log(
+        db,
+        user_id=admin.id,
+        username=admin.username,
+        action="SESSION_REVOKE_ALL",
+        category="auth",
+        status="success",
+        request=request,
+        target=target_user.username,
+        details=f"Admin đăng xuất tất cả {revoked_count} phiên đang hoạt động của '{target_user.username}'",
+    )
+    return {"revoked_count": revoked_count, "username": target_user.username}
 
 
 @app.get("/api/admin/logs/export")

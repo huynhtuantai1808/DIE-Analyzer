@@ -26,6 +26,8 @@ const ACTION_LABELS = {
   USER_SUSPEND: 'Tạm dừng tài khoản',
   USER_ACTIVATE: 'Kích hoạt tài khoản',
   USER_DELETE: 'Xóa tài khoản',
+  SESSION_REVOKE: 'Thu hồi phiên đăng nhập',
+  SESSION_REVOKE_ALL: 'Đăng xuất mọi thiết bị',
   SETTINGS_UPDATE: 'Cập nhật cài đặt',
   ADMIN_CLEANUP: 'Dọn dẹp lưu trữ',
   EXPORT_LOGS: 'Xuất nhật ký',
@@ -481,11 +483,12 @@ function App() {
   const [logFilterDays, setLogFilterDays] = useState('');
   const [logQuery, setLogQuery] = useState('');
   const [logsLoading, setLogsLoading] = useState(false);
+  const [activeSessions, setActiveSessions] = useState([]);
 
   useEffect(() => {
     if (token) {
       api.defaults.headers.common.Authorization = `Bearer ${token}`;
-      api.get('/auth/me').then(r => setMe(r.data)).catch(logout);
+      api.get('/auth/me').then(r => setMe(r.data)).catch(() => logout(false));
     }
   }, [token]);
 
@@ -534,9 +537,10 @@ function App() {
     }
   }, [selected?.id]);
 
-  function logout() {
-    if (localStorage.getItem('token')) {
-      api.post('/auth/logout').catch(() => {});
+  function logout(notifyServer = true) {
+    const tok = localStorage.getItem('token');
+    if (notifyServer && tok) {
+      api.post('/auth/logout', {}, { headers: { Authorization: `Bearer ${tok}` } }).catch(() => {});
     }
     localStorage.removeItem('token');
     setToken(null);
@@ -545,6 +549,23 @@ function App() {
     setSelectedScanIds(new Set());
     delete api.defaults.headers.common.Authorization;
   }
+
+  useEffect(() => {
+    const interceptor = api.interceptors.response.use(
+      res => res,
+      err => {
+        const status = err.response?.status;
+        const url = err.config?.url || '';
+        if (!url.includes('/auth/login') && !url.includes('/auth/logout')) {
+          if (status === 401 || (status === 403 && String(err.response?.data?.detail || '').includes('tạm dừng'))) {
+            logout(false);
+          }
+        }
+        return Promise.reject(err);
+      }
+    );
+    return () => api.interceptors.response.eject(interceptor);
+  }, []);
 
   async function fetchLogs(categoryOverride = null) {
     if (!me || me.role !== 'admin') return;
@@ -575,6 +596,34 @@ function App() {
     } catch {}
   }
 
+  async function fetchActiveSessions() {
+    if (!me || me.role !== 'admin') return;
+    try {
+      const { data } = await api.get('/admin/sessions', { params: { active_only: true } });
+      setActiveSessions(data);
+    } catch {}
+  }
+
+  async function revokeSession(sessionId, username) {
+    try {
+      await api.post(`/admin/sessions/${sessionId}/revoke`);
+      setNotice(`Đã thu hồi phiên đăng nhập #${sessionId} của tài khoản "${username}".`);
+      await Promise.all([fetchActiveSessions(), fetchLoginSummary(), fetchLogs('auth')]);
+    } catch (err) {
+      setNotice(err.response?.data?.detail || 'Không thể thu hồi phiên đăng nhập.');
+    }
+  }
+
+  async function revokeAllUserSessions(userId, username) {
+    try {
+      const { data } = await api.post(`/admin/users/${userId}/revoke-sessions`);
+      setNotice(`Đã đăng xuất ${data.revoked_count} phiên đang hoạt động của "${username}".`);
+      await Promise.all([fetchActiveSessions(), fetchLoginSummary(), fetchLogs('auth')]);
+    } catch (err) {
+      setNotice(err.response?.data?.detail || 'Không thể đăng xuất các phiên của người dùng.');
+    }
+  }
+
   async function openLogins() {
     setTab('logins');
     setSelected(null);
@@ -583,7 +632,7 @@ function App() {
     setLogFilterUser('');
     setLogFilterDays('');
     setLogQuery('');
-    await Promise.all([fetchLoginSummary(), fetchLogs('auth')]);
+    await Promise.all([fetchLoginSummary(), fetchActiveSessions(), fetchLogs('auth')]);
   }
 
   async function openLogs() {
@@ -957,7 +1006,7 @@ function App() {
           <div className="user-chip">
             <div className="avatar">{me.username?.[0]?.toUpperCase()}</div>
             <div><b>{me.username}</b><small>{me.role}</small></div>
-            <button title="Đăng xuất" onClick={logout}><LogOut size={16} /></button>
+            <button title="Đăng xuất" onClick={() => logout(true)}><LogOut size={16} /></button>
           </div>
         </div>
       </aside>
@@ -1868,7 +1917,7 @@ function App() {
                   <span className="eyebrow">PHIÊN TRUY CẬP TÀI KHOẢN</span>
                   <h3>Tình trạng đăng nhập theo người dùng</h3>
                 </div>
-                <button className="icon-btn" onClick={() => { fetchLoginSummary(); fetchLogs('auth'); }} title="Làm mới dữ liệu">
+                <button className="icon-btn" onClick={() => { fetchLoginSummary(); fetchActiveSessions(); fetchLogs('auth'); }} title="Làm mới dữ liệu">
                   <RefreshCw size={16} />
                 </button>
               </div>
@@ -1878,6 +1927,7 @@ function App() {
                     <tr>
                       <th>TÀI KHOẢN</th>
                       <th>VAI TRÒ</th>
+                      <th>PHIÊN ĐANG MỞ</th>
                       <th>ĐĂNG NHẬP GẦN NHẤT</th>
                       <th>ĐỊA CHỈ IP GẦN NHẤT</th>
                       <th>THIẾT BỊ / TRÌNH DUYỆT</th>
@@ -1900,6 +1950,13 @@ function App() {
                           </b>
                         </td>
                         <td><span className="pill">{u.role}</span></td>
+                        <td>
+                          {u.active_sessions_count > 0 ? (
+                            <span className="pill completed">{u.active_sessions_count} phiên</span>
+                          ) : (
+                            <span className="muted">0</span>
+                          )}
+                        </td>
                         <td>{u.last_login_at ? date(u.last_login_at) : <span className="muted">Chưa đăng nhập</span>}</td>
                         <td className="mono">{u.last_login_ip || '—'}</td>
                         <td style={{ maxWidth: '240px', overflow: 'hidden', textOverflow: 'ellipsis' }} title={u.last_login_ua || ''}>
@@ -1924,6 +1981,16 @@ function App() {
                             >
                               Lọc log login
                             </button>
+                            {u.active_sessions_count > 0 && (
+                              <button
+                                className="text-btn"
+                                style={{ color: '#fb923c', fontSize: '13px', fontWeight: 600 }}
+                                onClick={() => revokeAllUserSessions(u.id, u.username)}
+                                title="Thu hồi toàn bộ token/phiên đang hoạt động trong DB của user này"
+                              >
+                                Đăng xuất hết
+                              </button>
+                            )}
                             <button
                               className="text-btn"
                               style={{ color: '#fbbf24', fontSize: '13px', fontWeight: 600 }}
@@ -1935,6 +2002,71 @@ function App() {
                         </td>
                       </tr>
                     ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <div className="panel">
+              <div className="panel-head">
+                <div>
+                  <span className="eyebrow">QUẢN LÝ PHIÊN TRỰC TIẾP TRONG CSDL (DB SESSIONS)</span>
+                  <h3>Phiên đăng nhập đang hoạt động ({activeSessions.length})</h3>
+                </div>
+                <button className="icon-btn" onClick={fetchActiveSessions} title="Làm mới danh sách phiên">
+                  <RefreshCw size={16} />
+                </button>
+              </div>
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>TÀI KHOẢN</th>
+                      <th>VAI TRÒ</th>
+                      <th>ĐỊA CHỈ IP</th>
+                      <th>THIẾT BỊ / USER-AGENT</th>
+                      <th>ĐĂNG NHẬP LÚC</th>
+                      <th>HOẠT ĐỘNG CUỐI</th>
+                      <th>HẾT HẠN LÚC</th>
+                      <th style={{ textAlign: 'center' }}>THAO TÁC</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {activeSessions.map(s => (
+                      <tr key={s.id}>
+                        <td>
+                          <span className="user-badge"><User size={12} /> {s.username}</span>
+                        </td>
+                        <td><span className="pill">{s.role}</span></td>
+                        <td className="mono">{s.ip_address || '—'}</td>
+                        <td style={{ maxWidth: '240px', overflow: 'hidden', textOverflow: 'ellipsis' }} title={s.user_agent || ''}>
+                          <span className="muted small">{s.user_agent || '—'}</span>
+                        </td>
+                        <td className="mono">{date(s.created_at)}</td>
+                        <td className="mono">{date(s.last_seen_at)}</td>
+                        <td className="mono">{date(s.expires_at)}</td>
+                        <td style={{ textAlign: 'center' }}>
+                          {s.is_current ? (
+                            <span className="pill completed">Phiên hiện tại</span>
+                          ) : (
+                            <button
+                              type="button"
+                              className="text-btn"
+                              style={{ color: '#f87171', fontSize: '13px', fontWeight: 600, display: 'inline-flex', alignItems: 'center', gap: '4px' }}
+                              onClick={() => revokeSession(s.id, s.username)}
+                              title="Thu hồi token này khỏi DB ngay lập tức"
+                            >
+                              <LogOut size={12} /> <span>Thu hồi phiên</span>
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                    {!activeSessions.length && (
+                      <tr>
+                        <td colSpan="8" className="empty">Không có phiên đăng nhập nào đang hoạt động.</td>
+                      </tr>
+                    )}
                   </tbody>
                 </table>
               </div>

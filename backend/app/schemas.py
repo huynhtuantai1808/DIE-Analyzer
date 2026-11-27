@@ -99,6 +99,7 @@ class UserLoginSummaryItem(BaseModel):
     last_login_ua: str | None = None
     login_count: int = 0
     failed_count: int = 0
+    active_sessions_count: int = 0
 
 class LoginSummaryView(BaseModel):
     total_logs: int
@@ -107,4 +108,20 @@ class LoginSummaryView(BaseModel):
     active_users_24h: int
     total_logins: int
     user_sessions: list[UserLoginSummaryItem]
+
+class UserSessionView(BaseModel):
+    id: int
+    jti: str
+    user_id: int
+    username: str
+    role: str
+    ip_address: str | None = None
+    user_agent: str | None = None
+    is_revoked: bool
+    created_at: datetime
+    last_seen_at: datetime
+    expires_at: datetime
+    revoked_at: datetime | None = None
+    is_current: bool = False
+    model_config = ConfigDict(from_attributes=True)
 
